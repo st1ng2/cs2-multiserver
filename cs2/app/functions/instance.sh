@@ -78,4 +78,5 @@ App::varsToPass () { cat <<-EOF ; }
 	ADMIN_SLOTS
 	TAGS
 	TITLE
+	CPU_AFFINITY
 EOF

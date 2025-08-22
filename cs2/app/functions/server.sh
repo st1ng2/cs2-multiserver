@@ -15,6 +15,48 @@ App::validateGSLT () {
 }
 
 
+App::validateCPUAffinity () {
+	[[ $CPU_AFFINITY ]] || return 0
+	
+	# Check if taskset is available
+	if ! command -v taskset >/dev/null 2>&1; then
+		error <<-EOF
+			**taskset** command not found! CPU affinity cannot be set.
+			Install the 'util-linux' package or remove CPU_AFFINITY setting.
+		EOF
+		return 1
+	fi
+	
+	# Validate CPU affinity format
+	if [[ ! $CPU_AFFINITY =~ ^[0-9]+([,-][0-9]+)*$ ]]; then
+		error <<-EOF
+			Invalid CPU_AFFINITY format: **$CPU_AFFINITY**
+			
+			Valid examples:
+			  "0-3"     (cores 0 through 3)
+			  "0,1,2,3" (cores 0, 1, 2, and 3)
+			  "4-7"     (cores 4 through 7)
+		EOF
+		return 1
+	fi
+	
+	# Get available CPU count
+	local max_cpu=$(($(nproc --all) - 1))
+	
+	# Extract the highest CPU number from the affinity string
+	local highest_cpu=$(echo "$CPU_AFFINITY" | grep -o '[0-9]\+' | sort -n | tail -1)
+	
+	if (( highest_cpu > max_cpu )); then
+		warning <<-EOF
+			CPU_AFFINITY specifies core $highest_cpu, but system only has cores 0-$max_cpu.
+			This may cause the server to fail to start.
+		EOF
+	fi
+	
+	debug <<< "CPU affinity validation passed: $CPU_AFFINITY (system has $((max_cpu + 1)) cores)"
+	return 0
+}
+
 App::buildLaunchCommand () {
 	# Read general config
 	.file "$INSTCFGDIR/server.conf"
@@ -34,6 +76,9 @@ App::buildLaunchCommand () {
 
 	######## Check GSLT ########
 	::hookable App::validateGSLT
+	
+	######## Validate CPU Affinity ########
+	App::validateCPUAffinity || return
 	
 	######## Check PORT ########
 	local PID=$(ss -Hulpn sport = :$PORT | grep -Eo 'pid=[0-9]+')
@@ -117,7 +162,39 @@ App::buildLaunchCommand () {
 	)
 
 	LAUNCH_DIR="$INSTANCE_DIR/game/bin/linuxsteamrt64"
-	LAUNCH_CMD="$(quote "./cs2" "${LAUNCH_ARGS[@]}")"
+	
+	# Build base command
+	local BASE_CMD="$(quote "./cs2" "${LAUNCH_ARGS[@]}")"
+	
+	# Add CPU affinity if configured
+	if [[ $CPU_AFFINITY ]]; then
+		LAUNCH_CMD="taskset -c $CPU_AFFINITY $BASE_CMD"
+		info <<< "CPU affinity configured: cores $CPU_AFFINITY"
+	else
+		LAUNCH_CMD="$BASE_CMD"
+	fi
+	
+	# Generate enhanced server start script with CPU affinity support
+	cat > "$TMPDIR/server-start.sh" <<-EOF
+		#! /bin/bash
+		$(declare -f timestamp)
+		cd "$LAUNCH_DIR"
+		SERVER_LOGFILE="$LOGDIR/\$(timestamp)-server.log"
+		LOG_LINK="$LOGDIR/server.log"
+		rm -f "\$LOG_LINK"
+		ln -s "\$SERVER_LOGFILE" "\$LOG_LINK"
+		
+		# Log CPU affinity information if configured
+		${CPU_AFFINITY:+echo "[\$(timestamp)] Starting CS2 server with CPU affinity: $CPU_AFFINITY" | tee -a "\$SERVER_LOGFILE"}
+		${CPU_AFFINITY:+echo "[\$(timestamp)] Available CPUs: \$(nproc --all)" | tee -a "\$SERVER_LOGFILE"}
+		
+		# Execute the server with optional CPU affinity
+		stdbuf -o0 -e0 $LAUNCH_CMD 2>&1 | tee "\$SERVER_LOGFILE"
+		
+		exit_code=\$?
+		echo "[\$(timestamp)] Server exited with code: \$exit_code" | tee -a "\$SERVER_LOGFILE"
+		echo \$exit_code > "$TMPDIR/server.exit-code"
+	EOF
 }
 
 
